@@ -1,0 +1,406 @@
+#!/bin/sh
+# Program to list alert logs
+#Help is available by running this program with -h argument
+#This script lists alert.log of all running instances and provide you the records with the string requested
+
+
+list_alertlogs()
+{
+  # Function to list alert logs of running instances
+ dbcount=0;
+ for pidsid in `ps -eaf|grep _smon_|grep -v 'grep'|awk '{split($8,mystr,"_");print $2":"mystr[3];}'`
+ do
+    pid=`echo ${pidsid}|cut -d":" -f1`
+    sid=`echo ${pidsid}|cut -d":" -f2`
+
+    if [ "${arg_inst}" != "" ]
+    then
+        if [ "${arg_inst}" != "${sid}" ]
+        then
+          continue
+        fi
+    fi
+    if [ -r /proc/${pid}/exe ]
+    then
+      dbhome=`ls -l /proc/${pid}/exe |awk '{count=split($11,mystr,"/");for (i=1;i<count-2;i++) dbhome=dbhome mystr[i]"/"; dbhome=dbhome mystr[count-2];print dbhome;}'`
+    else
+      dbhome=`cat /etc/oratab|sed -e 's/ //g'|grep -v '^#'|grep '^'${sid}|cut -d":" -f2|tail -1`
+    fi
+
+    if [ "${dbhome}" == "" ]
+    then
+         echo "ERROR  : Oracle SID ${sid} could not locate oracle home"
+         continue
+    fi
+
+##    echo next step
+    chk_asm=`echo ${sid}|cut -c 1`
+    if [ ${chk_asm} == '+' ]
+    then
+       grid_home=${dbhome}
+       db_type='asm'
+    else
+       db_type='rdbms'
+    fi
+##echo Database running on pid ${pid} wth sid ${sid} has Oracle Home as ${dbhome} type ${db_type}
+
+    set_ora_home ${dbhome}
+    ORACLE_SID=${sid}
+    export ORACLE_SID
+    asm_char=`echo ${sid}|cut -c 1`
+
+       db_alert_str=`sqlplus -s "/ as sysdba" <<EOF|grep '^Output'
+            set line 320
+            set pages 0
+            set feed off
+            col myline format a300
+     select 'Output:'||diag.value||'/alert_${sid}.log:'||bg.value||'/alert_+ASM.log:'||lower(logform.value)||':' as myline
+            from   (select max(value) as value from v\\$diag_info where name='Diag Trace') diag
+            ,      (select max(value) as value from v\\$parameter where name='background_dump_dest') bg
+            ,      (select max(value) as value from v\\$parameter where name='uniform_log_timestamp_format') logform;
+      exit
+EOF`
+
+##echo "Got alert logs as ${db_alert_str}"
+
+  diag_alert=`echo "${db_alert_str}"|cut -d":" -f2`
+  bg_alert=`echo "${db_alert_str}"|cut -d":" -f3`
+  logform=`echo "${db_alert_str}"|cut -d":" -f4`
+
+  if [ "${logform}" == "" ] && [ "${asm_char}" == "+" ]
+  then
+    logform="true"
+  fi
+
+##echo diag alert is ${diag_alert} and bg alert is ${bg_alert} logform ${logform}
+
+  diag_modtime=`stat ${diag_alert} 2>/dev/null|grep '^Modify:'|awk '{mystr=substr($0,9,19);print mystr;}'`
+  bg_modtime=`stat ${bg_alert} 2>/dev/null|grep '^Modify:'|awk '{mystr=substr($0,9,19);print mystr;}'`
+
+##  echo "diag_modtime = '${diag_modtime}' and bg_modtime = '${bg_modtime}'"
+
+
+  if [ "${bg_modtime}" == "" ] && [ "${diag_modtime}" == "" ]
+  then
+     echo could not locate alert log for instance ${sid} checked is ${diag_alert}
+     continue
+  else
+       if [ "${bg_modtime}" != "" ] && [ "${diag_modtime}" == "" ]
+       then
+          echo find which is latest from ${bg_modtime} and ${diag_modtime}
+          input_time="${bg_modtime}"
+          time_diff
+          bg_before=alrt_secs_diff
+          input_time="${diag_modtime}"
+          time_diff
+          diag_before=alrt_secs_diff
+
+          if [ ${bg_before} -gt ${diag_before} ]
+          then
+              alertlog_file=${diag_alert}
+              last_updated=${diag_before}
+          else
+              alertlog_file=${bg_alert}
+              last_updated=${bg_before}
+          fi
+       else
+             if [ "${bg_modtime}" == "" ]
+             then
+                  alertlog_file=${diag_alert}
+                  bg_before=alrt_secs_diff
+                  input_time="${diag_modtime}"
+                  time_diff
+                  last_updated=${alrt_secs_diff}
+             else
+                  alertlog_file=${bg_alert}
+                  input_time="${bg_modtime}"
+                  time_diff
+                  last_updated=${alrt_secs_diff}
+             fi
+       fi
+  fi
+
+   alrt_hr=`expr $alrt_secs_diff \/ 3600`
+   alrt_hr_mod=`expr $alrt_secs_diff \% 3600`
+   alrt_min=`expr $alrt_hr_mod \/ 60`
+   alrt_secs=`expr $alrt_secs_diff \% 60`
+
+   list_alrt_strings "${1}" "${2}" "${3}" "${4}"
+
+##  echo           *** alert log for ${sid} is ${alertlog_file} updated ${alrt_hr}:${alrt_min}:${alrt_secs} seconds before
+##  tail -15 ${alertlog_file}|awk '{ print "          "$0}'
+
+done
+
+}
+
+set_ora_home()
+{
+    mydbhome2set=$1
+    ORACLE_HOME=${mydbhome2set}
+    export ORACLE_HOME
+    PATH=${mydbhome2set}/bin:$ORGPATH
+    export PATH
+}
+
+time_diff()
+{
+
+##input is input_time
+curr_time=`date`
+
+tx_end=$(date -d "${curr_time}" +%s)
+tx_start=$(date -d "${input_time}" +%s)
+
+alrt_secs_diff=$(expr $tx_end - $tx_start )
+
+}
+
+list_alrt_strings()
+{
+# This function search the string along with the time preiod in alert.log as requested
+##alertlog "${alertlog_file}" "${1}" "${2}" "${3}" "${4}"
+##searchstr="ORA-15046"
+##searchstr="$1"
+##startdt=20200401
+##enddt=20200701
+##startdt=20190401
+##enddt=20200801
+
+chkdt=`echo "${3}"|grep -Ei '[0-9]*[dwmyh]'|tr 'A-Z' 'a-z'`
+if [ "${chkdt}" != "" ]
+then
+    mydt=`echo "${chkdt}"|awk '{print substr($0,1,length($0)-1)":"substr($0,length($0),1);}'`
+    howmany=`echo "${mydt}"|cut -d":" -f1`
+    period=`echo "${mydt}"|cut -d":" -f2`
+
+   if [ "${period}" == "d" ]
+   then
+        dtperiod="${howmany} days ago"
+   elif [ "${period}" == "h" ]
+   then
+        dtperiod="${howmany} hours ago"
+   elif [ "${period}" == "w" ]
+   then
+        dtperiod="${howmany} weeks ago"
+   elif [ "${period}" == "m" ]
+   then
+        dtperiod="${howmany} months ago"
+   elif [ "${period}" == "y" ]
+   then
+        dtperiod="${howmany} years ago"
+   else
+        dtperiod="${howmany} days ago"
+   fi
+    startdt=$(date --date="${dtperiod}" +"%Y%m%d%H%M%S")
+      enddt=$(date +"%Y%m%d%H%M%S")
+else
+    if [ "${3}" != "" ]
+    then
+       startdt=`echo "${3}000000"|sed -e 's/-//g'`
+       if [ "${4}" != "" ]
+       then
+          enddt=`echo "${4}235959"|sed -e 's/-//g'`
+       else
+          enddt=`date +"%Y%m%d%H%M%S"`
+       fi
+    else
+       startdt=19990101000000
+       enddt=`date +"%Y%m%d%H%M%S"`
+    fi
+
+    if [ "${startdt}" == "" ]
+    then
+      startdt=19990101000000
+    fi
+
+    if [ "${enddt}" == "" ]
+    then
+       enddt=`date +"%Y%m%d%H%M%S"`
+    fi
+    err=0
+    len=`echo "${startdt}"|wc -c`
+    if [ ${len} -ne 15 ]
+    then
+       echo "error on date string ${startdt}"
+       err=1
+    fi
+
+    len=`echo "${enddt}"|wc -c`
+    if [ ${len} -ne 15 ]
+    then
+        echo "error on date string ${enddt}"
+        err=1
+    fi
+
+    if [ ${err} -gt 0 ]
+    then
+       exit 1
+    fi
+fi
+
+if [ "${2}" == "" ]
+then
+  searchstr="ORA-"
+else
+  searchstr="${2}"
+fi
+limitmsgcnt=$1
+if [ "${limitmsgcnt}" == "" ]
+then
+  limitmsgcnt=1
+fi
+##alertfile=/data01/app/oracle/diag/asm/+asm/+ASM/trace/alert_+ASM.log
+echo processing ${myserver}:${alertlog_file}
+tac ${alertlog_file}|awk -v limitmsgcnt=${limitmsgcnt} -v startdt=${startdt} -v enddt=${enddt} -v searchstr="${searchstr}" '
+BEGIN { linecount=0; ora_found="no"; stop="no"; totmsg=0;record_line=1;max_record_len=100}
+        {
+        if (stop=="no" )
+         {
+           dt_string="no";
+           split($0,newwords,"T");
+           split($0,oldwords," ");
+           if (length(newwords[1])==10 && length(newwords)==2)
+              {
+##                  print "debug inside new date - ";
+                  split(newwords[1],nsplit,"-");
+                  if (length(nsplit)==3)
+                    {  mytimestr=substr(newwords[2],1,8);
+                       split(mytimestr,mytime,":");
+                       mydtstr=sprintf("%s%s%s%s%s%s",nsplit[1],nsplit[2],nsplit[3],mytime[1],mytime[2],mytime[3]);
+                      dt_string="yes";
+                      mydt=sprintf("%d",mydtstr);
+##                      print "debug new date - "mydt;
+                    }
+              }
+           if (dt_string == "no" )
+             {
+                if (length($0)==24 && length(oldwords)==5)
+                 {
+##                    print "debug inside old date - ";
+                           if ( $2 == "Jan" ) month="01";
+                      else if ( $2 == "Feb" ) month="02";
+                      else if ( $2 == "Mar" ) month="03";
+                      else if ( $2 == "Apr" ) month="04";
+                      else if ( $2 == "May" ) month="05";
+                      else if ( $2 == "Jun" ) month="06";
+                      else if ( $2 == "Jul" ) month="07";
+                      else if ( $2 == "Aug" ) month="08";
+                      else if ( $2 == "Sep" ) month="09";
+                      else if ( $2 == "Oct" ) month="10";
+                      else if ( $2 == "Nov" ) month="11";
+                      else if ( $2 == "Dec" ) month="12";
+                      else month="00";
+                    dt_month=sprintf("%d",month);
+                    if (dt_month>0 || dt_month <13 )
+                       { dt_string="yes";
+                         split(oldwords[4],mytime,":");
+                         mydtstr=sprintf("%s%s%s%s%s%s",oldwords[5],month,oldwords[3],mytime[1],mytime[2],mytime[3]);
+                         mydt=sprintf("%d",mydtstr);
+                     ##    print "debug old date - "mydt;
+                       }
+                 }
+             }
+           if (dt_string == "yes" )
+            {
+                 ##print "debug dt_string yes"
+                 if ( startdt >mydt ) stop="yes";
+                 ##print "***debug mydt="mydt" stardt="startdt" enddt="enddt;
+                 if (ora_found == "yes" && mydt >= startdt && mydt <=enddt )
+                 { totmsg=totmsg+1;
+                    myline[record_line]=$0;
+                  for (i=record_line;i>0;i--) print myline[i];
+                   if (totmsg>=limitmsgcnt) stop="yes";
+                   print "";
+                 }
+                 record_line=1; ora_found="no";
+            }
+           else
+            {   ##print "debug myline["record_line"]="$0;
+                myline[record_line]=$0;
+                if (record_line<=max_record_len) record_line=record_line+1;
+                if (index($0,searchstr)>0) { ora_found="yes"; } ##print "debug found string"$0;
+            }
+           linecount=linecount+1;
+        }
+      }'
+
+##split($0,words,"T"); if (length(words[1])==10) out="yes"; else out="no";
+
+}
+
+get_help()
+{
+echo "
+This program searches the Oracle database alert logs type of files with provided search string or \"ORA-\" string
+If a file not provided with the \"single\" keyword then alert logs of all the running instances will be processed
+You may pass the period in which you want to serach the string inside the alert log(s)
+
+Program usage is as follows
+ 1.  ${0}
+ 2.  ${0} <limit_record_count_number>
+ 3.  ${0} <limit_record_count_number> <search_string> <from_date_yyyy-mm-dd>
+ 4.  ${0} <limit_record_count_number> <search_string> <from_date_yyyy-mm-dd> <to_date_yyyy-mm-dd>
+ 5.  ${0} single <alert_log_file_name>
+ 6.  ${0} single <alert_log_file_name> <limit_record_count_number> <search_string>
+ 7.  ${0} single <alert_log_file_name> <limit_record_count_number> <search_string> <from_date_yyyy-mm-dd>
+ 8.  ${0} single <alert_log_file_name> <limit_record_count_number> <search_string> <from_date_yyyy-mm-dd> <to_date_yyyy-mm-dd>
+ 9.  Instead of specifying from and to date you may input 1d for one day 3m for 3 months like w for weeks and y for years h for hours
+
+Examples:
+  ${0}
+  ${0} single /data01/app/oracle/diag/rdbms/trace/alert_mysid.log 2 ORA-00600 1999-12-29 2020-02-19
+  ${0} 4  ORA-07445 1999-12-29 2020-02-19
+  ${0} 10 ORA-  2020-01-15 2020-03-01
+  ${0} 2
+  ${0} 2  ORA- 4w
+  ${0} 2  ORA- 1y
+  ${0} 2  ORA- 4h
+
+By default the search string is set to \"ORA-\" and number of  records limited to 1 per file
+It searches records from the bottom of the alert log to top so that latest records will be provided first
+"
+}
+
+if [ $# -eq 1 ]
+then
+   help_str=`echo "${1}"|cut -c 1-2`
+   if [ "${1}" == "-h" ]
+   then
+     get_help
+     exit 0
+   fi
+fi
+
+ORGPATH=$PATH
+ORGIFS="$IFS"
+arg_inst=""
+progdir=`dirname ${0}`
+myserver=`uname -n|cut -d"." -f1`
+if [ ${progdir} == "." ]
+then
+    progdir=`pwd`
+fi
+
+if [ "${1}" == "single" ]
+then
+   alertlog_file="${2}"
+   logdir=`dirname ${alertlog_file}`
+   if [ ${logdir} == "." ]
+   then
+       logdir=`pwd`
+       alertlog_file="${logdir}/${alertlog_file}"
+   fi
+
+   if [ -r ${alertlog_file} ]
+   then
+      list_alrt_strings "${3}" "${4}" "${5}" "${6}"
+   else
+      echo cannot read file ${alertlog_file}
+   fi
+else
+##echo
+##echo
+##echo "#### server `uname -n`###"
+list_alertlogs "${1}" "${2}" "${3}" "${4}"
+fi
