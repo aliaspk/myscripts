@@ -1,1 +1,2 @@
 Testing a new file
+Added new line to test.txt
